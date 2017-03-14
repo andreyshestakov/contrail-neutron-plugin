@@ -27,6 +27,7 @@ from neutron.extensions import external_net
 from neutron.extensions import l3
 from neutron.extensions import portbindings
 from neutron.extensions import securitygroup
+from neutron_plugin_contrail.extensions import physical
 from neutron_plugin_contrail.extensions import serviceinterface
 from neutron_plugin_contrail.extensions import vfbinding
 from neutron import neutron_plugin_base_v2
@@ -122,6 +123,7 @@ class NeutronPluginContrailCoreBase(neutron_plugin_base_v2.NeutronPluginBaseV2,
                                     portbindings_base.PortBindingBaseMixin,
                                     external_net.External_net,
                                     serviceinterface.Serviceinterface,
+                                    physical.Physical,
                                     vfbinding.Vfbinding):
 
     supported_extension_aliases = [
@@ -433,6 +435,46 @@ class NeutronPluginContrailCoreBase(neutron_plugin_base_v2.NeutronPluginBaseV2,
                 port[portbindings.VNIC_TYPE] == portbindings.VNIC_NORMAL:
             return True
 
+    def _get_physical_port_info(self, port):
+        lli = port.get('binding:profile', {}).get('local_link_information', [{}])
+        switch_name = lli[0].get('switch_info')
+        port_name = lli[0].get('port_id')
+        if switch_name and port_name:
+            router_fq_name = ['default-global-system-config', switch_name]
+            piface_fq_name = router_fq_name + [port_name]
+            liface_fq_name = piface_fq_name + ["%s.0" % port_name]
+            return router_fq_name, piface_fq_name, liface_fq_name
+        return None, None, None
+
+    def _bind_port(self, port):
+        LOG.debug("Binding port %s" % str(port))
+        router_fq_name, piface_fq_name, liface_fq_name = self._get_physical_port_info(port)
+        if liface_fq_name and self.get_physical_router(router_fq_name):
+            piface = self.get_physical_interface(piface_fq_name)
+            if not piface:
+                piface = self.create_physical_interface(piface_fq_name)
+            liface = self.get_logical_interface(liface_fq_name)
+            if not liface:
+                liface = self.create_logical_interface(liface_fq_name)
+            vmi = self.get_virtual_machine_interface(port['id'])
+            liface.set_logical_interface_vlan_tag(0)
+            liface.set_virtual_machine_interface(vmi)
+            self.update_logical_interface(liface)
+        else:
+            LOG.debug("Port has no binding information")
+
+    def _unbind_port(self, port):
+        LOG.debug("Unbinding port %s" % str(port))
+        router_fq_name, piface_fq_name, liface_fq_name = self._get_physical_port_info(port)
+        if liface_fq_name:
+            liface = self.get_logical_interface(liface_fq_name)
+            if liface:
+                vmi = self.get_virtual_machine_interface(port['id'])
+                liface.del_virtual_machine_interface(vmi)
+                self.update_logical_interface(liface)
+        else:
+            LOG.debug("Port has no binding information")
+
     def _is_dpdk_enabled(self, context, port):
         vrouter = {'dpdk_enabled': False}
 
@@ -478,6 +520,9 @@ class NeutronPluginContrailCoreBase(neutron_plugin_base_v2.NeutronPluginBaseV2,
             port = self._update_resource('port', context, port['id'],
                                          {'port': port})
 
+        if port.get('binding:profile'):
+            self._bind_port(port)
+
         return port
 
     def get_port(self, context, port_id, fields=None):
@@ -498,6 +543,17 @@ class NeutronPluginContrailCoreBase(neutron_plugin_base_v2.NeutronPluginBaseV2,
                 context, original['network_id'], port_id,
                 original['fixed_ips'], port['port']['fixed_ips'])
             port['port']['fixed_ips'] = prev_ips + added_ips
+
+        binding_profile = port['port'].get('binding:profile')
+        if binding_profile is not None:
+            port['port'].pop('binding:host_id', None)
+            port['port'].pop('binding:vnic_type', None)
+            if binding_profile != {}:
+                original['binding:profile'] = binding_profile
+                self._bind_port(original)
+            else:
+                self._unbind_port(original)
+                original['binding:profile'] = binding_profile
 
         if 'binding:host_id' in port['port']:
             original['binding:host_id'] = port['port']['binding:host_id']
@@ -531,7 +587,9 @@ class NeutronPluginContrailCoreBase(neutron_plugin_base_v2.NeutronPluginBaseV2,
         the remote interface is first un-plugged and then the port
         is deleted.
         """
-
+        port_obj = self._get_resource('port', context, port_id, None)
+        if port_obj.get('binding:profile'):
+            self._unbind_port(port_obj)
         self._delete_resource('port', context, port_id)
 
     def get_ports(self, context, filters=None, fields=None):

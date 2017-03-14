@@ -312,6 +312,10 @@ class NeutronPluginContrailCoreV2(plugin_base.NeutronPluginContrailCoreBase):
                                                       res_type, 'READALL')
         res_dicts = self._transform_response(status_code, info=res_info,
                                              fields=fields, obj_name=res_type)
+        mac = filters.get('mac_address')
+        if mac:
+            res_dicts = list(filter(lambda r: r['mac_address'] in mac, res_dicts))
+
         LOG.debug(
             "get_%(res_type)s(): filters: %(filters)r data: %(res_dicts)r",
             {'res_type': res_type, 'filters': filters,
